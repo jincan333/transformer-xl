@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.append('utils')
-from proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
-from log_uniform_sampler import LogUniformSampler, sample_logits
+from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
+from utils.log_uniform_sampler import LogUniformSampler, sample_logits
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, demb):
@@ -658,6 +658,7 @@ class MemTransformerLM(nn.Module):
         else:
             dec_attn_mask = torch.triu(
                 word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:,:,None]
+        dec_attn_mask = dec_attn_mask.to(torch.bool)
 
         hids = []
         if self.attn_type == 0: # default

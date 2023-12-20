@@ -35,6 +35,8 @@ class Vocab(object):
 
     def count_file(self, path, verbose=False, add_eos=False):
         if verbose: print('counting file {} ...'.format(path))
+        print(f"Path being used: {path}")
+        print(f"Current working directory: {os.getcwd()}")
         assert os.path.exists(path)
 
         sents = []
