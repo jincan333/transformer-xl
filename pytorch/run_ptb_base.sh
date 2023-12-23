@@ -1,14 +1,14 @@
 #!/bin/bash
 max_step=200000
-experiment_name=transfomer_wt103_baseline_${max_step}
+experiment_name=transfomer_ptb_baseline_${max_step}
 if [[ $1 == 'train' ]]; then
     echo 'Run training...'
     log_filename=logs/train_${experiment_name}.log
     nohup python -u pytorch/train.py \
         --cuda \
-        --gpu 1 \
-        --data data/wikitext-103/ \
-        --dataset wt103 \
+        --gpu 2 \
+        --data data/ptb/ \
+        --dataset ptb \
         --adaptive \
         --n_layer 16 \
         --d_model 410 \

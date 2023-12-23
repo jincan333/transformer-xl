@@ -197,12 +197,16 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 # adaptive softmax / embedding
 cutoffs, tie_projs = [], [False]
 if args.adaptive:
-    assert args.dataset in ['wt103', 'lm1b']
+    assert args.dataset in ['wt103', 'lm1b', 'ptb']
     if args.dataset == 'wt103':
         cutoffs = [20000, 40000, 200000]
         tie_projs += [True] * len(cutoffs)
     elif args.dataset == 'lm1b':
         cutoffs = [60000, 100000, 640000]
+        tie_projs += [False] * len(cutoffs)
+    elif args.dataset == 'ptb':
+        # TODO
+        cutoffs = [20000, 40000, 200000]
         tie_projs += [False] * len(cutoffs)
 
 ###############################################################################
