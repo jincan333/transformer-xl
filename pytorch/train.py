@@ -90,6 +90,7 @@ parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
+parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--adaptive', action='store_true',
                     help='use adaptive softmax')
 parser.add_argument('--div_val', type=int, default=1,
@@ -176,7 +177,7 @@ if args.fp16:
             print('WARNING: apex not installed, ignoring --fp16 option')
             args.fp16 = False
 
-device = torch.device('cuda' if args.cuda else 'cpu')
+device = torch.device(f'cuda:{args.gpu}' if args.cuda else 'cpu')
 
 ###############################################################################
 # Load data

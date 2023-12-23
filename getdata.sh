@@ -46,11 +46,11 @@ fi
 # fi
 
 echo "- Downloading Penn Treebank (PTB)"
-if [[ ! -d 'penn' ]]; then
+if [[ ! -d 'ptb' ]]; then
     wget --quiet --continue http://www.fit.vutbr.cz/~imikolov/rnnlm/simple-examples.tgz
     tar -xzf simple-examples.tgz
 
-    mkdir -p penn
+    mkdir -p ptb
     cd penn
     mv ../simple-examples/data/ptb.train.txt train.txt
     mv ../simple-examples/data/ptb.test.txt test.txt
@@ -58,8 +58,8 @@ if [[ ! -d 'penn' ]]; then
     cd ..
 
     echo "- Downloading Penn Treebank (Character)"
-    mkdir -p pennchar
-    cd pennchar
+    mkdir -p ptbchar
+    cd ptbchar
     mv ../simple-examples/data/ptb.char.train.txt train.txt
     mv ../simple-examples/data/ptb.char.test.txt test.txt
     mv ../simple-examples/data/ptb.char.valid.txt valid.txt

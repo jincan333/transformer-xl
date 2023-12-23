@@ -1,9 +1,12 @@
 #!/bin/bash
-
+max_step=200000
+experiment_name=baseline_transfomer_${max_step}
 if [[ $1 == 'train' ]]; then
     echo 'Run training...'
-    python pytorch/train.py \
+    log_filename=logs/train_${experiment_name}.log
+    nohup python -u pytorch/train.py \
         --cuda \
+        --gpu 1 \
         --data data/wikitext-103/ \
         --dataset wt103 \
         --adaptive \
@@ -22,12 +25,16 @@ if [[ $1 == 'train' ]]; then
         --mem_len 150 \
         --eval_tgt_len 150 \
         --batch_size 60 \
+        ${@:2} \
+        > ${log_filename} 2>&1 &
         # --multi_gpu \
         # --gpu0_bsz 4 \
-        ${@:2}
+        
+        
 elif [[ $1 == 'eval' ]]; then
     echo 'Run evaluation...'
-    python pytorch/eval.py \
+    log_filename=logs/test_${experiment_name}.log
+    nohup python -u pytorch/eval.py \
         --cuda \
         --data ../data/wikitext-103/ \
         --dataset wt103 \
@@ -36,7 +43,10 @@ elif [[ $1 == 'eval' ]]; then
         --clamp_len 400 \
         --same_length \
         --split test \
-        ${@:2}
+        ${@:2} 
+        > ${log_filename} 2>&1 &
+        
+        
 else
     echo 'unknown argment 1'
 fi
