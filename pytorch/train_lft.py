@@ -15,6 +15,10 @@ from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
+import torch.nn.functional as F
+import configparser
+import wandb
+
 
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='data/wikitext-103',
@@ -103,7 +107,7 @@ parser.add_argument('--multi_gpu', action='store_true',
                     help='use multiple GPU')
 parser.add_argument('--log-interval', type=int, default=200,
                     help='report interval')
-parser.add_argument('--eval-interval', type=int, default=2000,
+parser.add_argument('--eval-interval', type=int, default=1000,
                     help='evaluation interval')
 parser.add_argument('--work_dir', default='LM-TFM', type=str,
                     help='experiment directory.')
@@ -142,6 +146,15 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.  If supplied, this argument'
                     ' supersedes --static-loss-scale.')
+parser.add_argument('--alpha', type=float, default= 0)
+parser.add_argument('--student_ratio', type=int, default= 0)
+parser.add_argument('--models_num', type=int, default= 2)
+parser.add_argument('--T', type=float, default=1.5)
+parser.add_argument('--exp_name', type=str, default='test')
+parser.add_argument('--max_epoch', type=int, default=4)
+parser.add_argument('--start_epoch', type=int, default=-1)
+
+
 args = parser.parse_args()
 args.tied = not args.not_tied
 
@@ -178,6 +191,15 @@ if args.fp16:
             args.fp16 = False
 
 device = torch.device(f'cuda:{args.gpu}' if args.cuda else 'cpu')
+
+current_file_dir = os.path.dirname(os.path.abspath(__file__))
+config_file_path = os.path.join(current_file_dir, '../../.config')
+config=configparser.ConfigParser()
+config.read(config_file_path)
+wandb_username=config.get('WANDB', 'USER_NAME')
+wandb_key=config.get('WANDB', 'API_KEY')
+wandb.login(key=wandb_key)
+wandb.init(project='ensemble_distill_unequal_steps_transformer', entity=wandb_username, name=args.exp_name)
 
 ###############################################################################
 # Load data
@@ -271,76 +293,116 @@ def update_dropatt(m):
         m.dropatt.p = args.dropatt
 
 if args.restart:
-    with open(os.path.join(args.restart_dir, 'model.pt'), 'rb') as f:
-        model = torch.load(f)
+    with open(os.path.join(args.restart_dir, 't_model.pt'), 'rb') as f:
+        t_model = torch.load(f)
     if not args.fp16:
-        model = model.float()
-    model.apply(update_dropout)
-    model.apply(update_dropatt)
+        t_model = t_model.float()
+    t_model.apply(update_dropout)
+    t_model.apply(update_dropatt)
 else:
-    model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
+    t_model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
         args.d_head, args.d_inner, args.dropout, args.dropatt,
         tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
         tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
         ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
         same_length=args.same_length, attn_type=args.attn_type,
         clamp_len=args.clamp_len, sample_softmax=args.sample_softmax)
-    model.apply(weights_init)
-    model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
-args.n_all_param = sum([p.nelement() for p in model.parameters()])
-args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
+    t_model.apply(weights_init)
+    t_model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
+
+    s_model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
+        args.d_head, args.d_inner, args.dropout, args.dropatt,
+        tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
+        tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
+        ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
+        same_length=args.same_length, attn_type=args.attn_type,
+        clamp_len=args.clamp_len, sample_softmax=args.sample_softmax)
+    s_model.apply(weights_init)
+    s_model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
+
+args.n_all_param = sum([p.nelement() for p in t_model.parameters()])*2
+args.n_nonemb_param = sum([p.nelement() for p in t_model.layers.parameters()])*2
 
 if args.fp16:
-    model = model.half()
+    t_model, s_model = t_model.half(), s_model.half()
 
 if args.multi_gpu:
-    model = model.to(device)
+    t_model, s_model = t_model.to(device), s_model.to(device)
     if args.gpu0_bsz >= 0:
-        para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
-                                          model, dim=1).to(device)
+        t_para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk, t_model, dim=1).to(device)
+        s_para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk, s_model, dim=1).to(device)
     else:
-        para_model = nn.DataParallel(model, dim=1).to(device)
+        t_para_model = nn.DataParallel(t_model, dim=1).to(device)
+        s_para_model = nn.DataParallel(s_model, dim=1).to(device)
 else:
-    para_model = model.to(device)
+    t_para_model = t_model.to(device)
+    s_para_model = s_model.to(device)
 
 #### optimizer
 if args.optim.lower() == 'sgd':
     if args.sample_softmax > 0:
-        dense_params, sparse_params = [], []
-        for param in model.parameters():
-            if param.size() == model.word_emb.weight.size():
-                sparse_params.append(param)
+        t_dense_params, t_sparse_params = [], []
+        for param in t_model.parameters():
+            if param.size() == t_model.word_emb.weight.size():
+                t_sparse_params.append(param)
             else:
-                dense_params.append(param)
-        optimizer_sparse = optim.SGD(sparse_params, lr=args.lr * 2)
-        optimizer = optim.SGD(dense_params, lr=args.lr, momentum=args.mom)
+                t_dense_params.append(param)
+        t_optimizer_sparse = optim.SGD(t_sparse_params, lr=args.lr * 2)
+        t_optimizer = optim.SGD(t_dense_params, lr=args.lr, momentum=args.mom)
+
+        s_dense_params, s_sparse_params = [], []
+        for param in s_model.parameters():
+            if param.size() == s_model.word_emb.weight.size():
+                s_sparse_params.append(param)
+            else:
+                s_dense_params.append(param)
+        s_optimizer_sparse = optim.SGD(s_sparse_params, lr=args.lr * 2)
+        s_optimizer = optim.SGD(s_dense_params, lr=args.lr, momentum=args.mom)
     else:
-        optimizer = optim.SGD(model.parameters(), lr=args.lr,
+        t_optimizer = optim.SGD(t_model.parameters(), lr=args.lr,
+            momentum=args.mom)
+        s_optimizer = optim.SGD(s_model.parameters(), lr=args.lr,
             momentum=args.mom)
 elif args.optim.lower() == 'adam':
     if args.sample_softmax > 0:
-        dense_params, sparse_params = [], []
-        for param in model.parameters():
-            if param.size() == model.word_emb.weight.size():
-                sparse_params.append(param)
+        t_dense_params, t_sparse_params = [], []
+        for param in t_model.parameters():
+            if param.size() == t_model.word_emb.weight.size():
+                t_sparse_params.append(param)
             else:
-                dense_params.append(param)
-        optimizer_sparse = optim.SparseAdam(sparse_params, lr=args.lr)
-        optimizer = optim.Adam(dense_params, lr=args.lr)
+                t_dense_params.append(param)
+        t_optimizer_sparse = optim.SparseAdam(t_sparse_params, lr=args.lr)
+        t_optimizer = optim.Adam(t_dense_params, lr=args.lr)
+
+        s_dense_params, s_sparse_params = [], []
+        for param in s_model.parameters():
+            if param.size() == s_model.word_emb.weight.size():
+                s_sparse_params.append(param)
+            else:
+                s_dense_params.append(param)
+        s_optimizer_sparse = optim.SparseAdam(s_sparse_params, lr=args.lr)
+        s_optimizer = optim.Adam(s_dense_params, lr=args.lr)
     else:
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        t_optimizer = optim.Adam(t_model.parameters(), lr=args.lr)
+        s_optimizer = optim.Adam(s_model.parameters(), lr=args.lr)
 elif args.optim.lower() == 'adagrad':
-    optimizer = optim.Adagrad(model.parameters(), lr=args.lr)
+    t_optimizer = optim.Adagrad(t_model.parameters(), lr=args.lr)
+    s_optimizer = optim.Adagrad(s_model.parameters(), lr=args.lr)
 
 #### scheduler
 if args.scheduler == 'cosine':
     # here we do not set eta_min to lr_min to be backward compatible
     # because in previous versions eta_min is default to 0
     # rather than the default value of lr_min 1e-6
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
+    t_scheduler = optim.lr_scheduler.CosineAnnealingLR(t_optimizer,
         args.max_step, eta_min=args.eta_min) # should use eta_min arg
+    s_scheduler = optim.lr_scheduler.CosineAnnealingLR(s_optimizer,
+        args.max_step, eta_min=args.eta_min) # should use eta_min arg
+    
     if args.sample_softmax > 0:
-        scheduler_sparse = optim.lr_scheduler.CosineAnnealingLR(optimizer_sparse,
+        t_scheduler_sparse = optim.lr_scheduler.CosineAnnealingLR(t_optimizer_sparse,
+            args.max_step, eta_min=args.eta_min) # should use eta_min arg
+        s_scheduler_sparse = optim.lr_scheduler.CosineAnnealingLR(s_optimizer_sparse,
             args.max_step, eta_min=args.eta_min) # should use eta_min arg
 elif args.scheduler == 'inv_sqrt':
     # originally used for Transformer (in Attention is all you need)
@@ -351,12 +413,17 @@ elif args.scheduler == 'inv_sqrt':
         else:
             return 1. / (step ** 0.5) if step > args.warmup_step \
                    else step / (args.warmup_step ** 1.5)
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    t_scheduler = optim.lr_scheduler.LambdaLR(t_optimizer, lr_lambda=lr_lambda)
+    s_scheduler = optim.lr_scheduler.LambdaLR(s_optimizer, lr_lambda=lr_lambda)
 elif args.scheduler == 'dev_perf':
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+    t_scheduler = optim.lr_scheduler.ReduceLROnPlateau(t_optimizer,
+        factor=args.decay_rate, patience=args.patience, min_lr=args.lr_min)
+    s_scheduler = optim.lr_scheduler.ReduceLROnPlateau(s_optimizer,
         factor=args.decay_rate, patience=args.patience, min_lr=args.lr_min)
     if args.sample_softmax > 0:
-        scheduler_sparse = optim.lr_scheduler.ReduceLROnPlateau(optimizer_sparse,
+        t_scheduler_sparse = optim.lr_scheduler.ReduceLROnPlateau(t_optimizer_sparse,
+            factor=args.decay_rate, patience=args.patience, min_lr=args.lr_min)
+        s_scheduler_sparse = optim.lr_scheduler.ReduceLROnPlateau(s_optimizer_sparse,
             factor=args.decay_rate, patience=args.patience, min_lr=args.lr_min)
 elif args.scheduler == 'constant':
     pass
@@ -364,16 +431,23 @@ elif args.scheduler == 'constant':
 if args.cuda and args.fp16:
     # If args.dynamic_loss_scale is False, static_loss_scale will be used.
     # If args.dynamic_loss_scale is True, it will take precedence over static_loss_scale.
-    optimizer = FP16_Optimizer(optimizer,
+    t_optimizer = FP16_Optimizer(t_optimizer,
+                               static_loss_scale = args.static_loss_scale,
+                               dynamic_loss_scale = args.dynamic_loss_scale,
+                               dynamic_loss_args = {'init_scale': 2 ** 16})
+    s_optimizer = FP16_Optimizer(s_optimizer,
                                static_loss_scale = args.static_loss_scale,
                                dynamic_loss_scale = args.dynamic_loss_scale,
                                dynamic_loss_args = {'init_scale': 2 ** 16})
 
 if args.restart:
-    if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
-        with open(os.path.join(args.restart_dir, 'optimizer.pt'), 'rb') as f:
+    if os.path.exists(os.path.join(args.restart_dir, 't_optimizer.pt')) and os.path.exists(os.path.join(args.restart_dir, 's_optimizer.pt')):
+        with open(os.path.join(args.restart_dir, 't_optimizer.pt'), 'rb') as f:
             opt_state_dict = torch.load(f)
-            optimizer.load_state_dict(opt_state_dict)
+            t_optimizer.load_state_dict(opt_state_dict)
+        with open(os.path.join(args.restart_dir, 's_optimizer.pt'), 'rb') as f:
+            opt_state_dict = torch.load(f)
+            s_optimizer.load_state_dict(opt_state_dict)
     else:
         print('Optimizer was not saved. Start from scratch.')
 
@@ -390,80 +464,214 @@ logging('#non emb params = {}'.format(args.n_nonemb_param))
 
 def evaluate(eval_iter):
     # Turn on evaluation mode which disables dropout.
-    model.eval()
+    t_model.eval()
+    s_model.eval()
 
     # If the model does not use memory at all, make the ext_len longer.
     # Otherwise, make the mem_len longer and keep the ext_len the same.
     if args.mem_len == 0:
-        model.reset_length(args.eval_tgt_len,
+        t_model.reset_length(args.eval_tgt_len,
+            args.ext_len+args.tgt_len-args.eval_tgt_len, args.mem_len)
+        s_model.reset_length(args.eval_tgt_len,
             args.ext_len+args.tgt_len-args.eval_tgt_len, args.mem_len)
     else:
-        model.reset_length(args.eval_tgt_len,
+        t_model.reset_length(args.eval_tgt_len,
+            args.ext_len, args.mem_len+args.tgt_len-args.eval_tgt_len)
+        s_model.reset_length(args.eval_tgt_len,
             args.ext_len, args.mem_len+args.tgt_len-args.eval_tgt_len)
 
     # Evaluation
-    total_len, total_loss = 0, 0.
+    t_total_len, t_total_loss = 0, 0.
     with torch.no_grad():
-        mems = tuple()
+        t_mems = tuple()
         for i, (data, target, seq_len) in enumerate(eval_iter):
             if args.max_eval_steps > 0 and i >= args.max_eval_steps:
                 break
-            ret = model(data, target, *mems)
-            loss, mems = ret[0], ret[1:]
-            loss = loss.mean()
-            total_loss += seq_len * loss.float().item()
-            total_len += seq_len
+            t_ret, t_logit = t_model(data, target, *t_mems)
+            t_loss, t_mems = t_ret[0], t_ret[1:]
+            t_loss = t_loss.mean()
+            t_total_loss += seq_len * t_loss.float().item()
+            t_total_len += seq_len
 
     # Switch back to the training mode
-    model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
-    model.train()
+    t_model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
+    t_model.train()
 
-    return total_loss / total_len
+    s_total_len, s_total_loss = 0, 0.
+    with torch.no_grad():
+        s_mems = tuple()
+        for i, (data, target, seq_len) in enumerate(eval_iter):
+            if args.max_eval_steps > 0 and i >= args.max_eval_steps:
+                break
+            s_ret, s_logit = s_model(data, target, *s_mems)
+            s_loss, s_mems = s_ret[0], s_ret[1:]
+            s_loss = s_loss.mean()
+            s_total_loss += seq_len * s_loss.float().item()
+            s_total_len += seq_len
+
+    # Switch back to the training mode
+    s_model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
+    s_model.train()
+
+    return t_total_loss / t_total_len, s_total_loss / s_total_len
 
 
+def kl_div_logits(p, q, T):
+    loss_func = nn.KLDivLoss(reduction = 'batchmean', log_target=True)
+    loss = loss_func(F.log_softmax(p/T, dim=-1), F.log_softmax(q/T, dim=-1)) * T * T
+    return loss
+
+current_index = 0
 def train():
     # Turn on training mode which enables dropout.
-    global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
-    model.train()
+    global train_step, t_train_loss, t_best_val_loss, s_train_loss, s_best_val_loss, eval_start_time, log_start_time, current_index, epoch
+    t_model.train()
+    s_model.train()
     if args.batch_chunk > 1:
-        mems = [tuple() for _ in range(args.batch_chunk)]
+        t_mems = [tuple() for _ in range(args.batch_chunk)]
+        s_mems = [tuple() for _ in range(args.batch_chunk)]
     else:
-        mems = tuple()
+        t_mems = tuple()
+        s_mems = tuple()
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
     for batch, (data, target, seq_len) in enumerate(train_iter):
-        model.zero_grad()
+        t_model.zero_grad()
+        s_model.zero_grad()
         if args.batch_chunk > 1:
             data_chunks = torch.chunk(data, args.batch_chunk, 1)
             target_chunks = torch.chunk(target, args.batch_chunk, 1)
             for i in range(args.batch_chunk):
                 data_i = data_chunks[i].contiguous()
                 target_i = target_chunks[i].contiguous()
-                ret = para_model(data_i, target_i, *mems[i])
-                loss, mems[i] = ret[0], ret[1:]
-                loss = loss.float().mean().type_as(loss) / args.batch_chunk
+                
+                t_ret, t_logit = t_para_model(data_i, target_i, *t_mems[i])
+                t_loss, t_mems[i] = t_ret[0], t_ret[1:]
+
+                # if args.alpha > 0:
+                s_ret, s_logit = s_para_model(data_i, target_i, *s_mems[i])
+                s_loss, s_mems[i] = s_ret[0], s_ret[1:]
+                
+                if epoch > args.start_epoch:
+                    t_loss += args.alpha * kl_div_logits(t_logit, s_logit.detach(), args.T)
+                    s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
+
+                t_loss = t_loss.float().mean().type_as(t_loss) / args.batch_chunk
+                s_loss = s_loss.float().mean().type_as(s_loss) / args.batch_chunk
                 if args.fp16:
-                    optimizer.backward(loss)
+                    t_optimizer.backward(t_loss)
+                    s_optimizer.backward(s_loss)
                 else:
-                    loss.backward()
-                train_loss += loss.float().item()
+                    t_loss.backward()
+                    s_loss.backward()
+
+                t_train_loss += t_loss.float().item()
+                s_train_loss += s_loss.float().item()
+
+                # else:
+                #     t_loss = t_loss.float().mean().type_as(t_loss) / args.batch_chunk
+                #     if args.fp16:
+                #         t_optimizer.backward(t_loss)
+                #     else:
+                #         t_loss.backward()
+                #     t_train_loss += t_loss.float().item()
         else:
-            ret = para_model(data, target, *mems)
-            loss, mems = ret[0], ret[1:]
-            loss = loss.float().mean().type_as(loss)
+            t_ret, t_logit = t_para_model(data, target, *t_mems)
+            t_loss, t_mems = t_ret[0], t_ret[1:]
+
+            # if args.alpha > 0:
+            s_ret, s_logit = s_para_model(data, target, *s_mems)
+            s_loss, s_mems = s_ret[0], s_ret[1:]
+
+            if epoch > args.start_epoch:
+                t_loss += args.alpha * kl_div_logits(t_logit, s_logit.detach(), args.T)
+                s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
+
+            t_loss = t_loss.float().mean().type_as(t_loss)
+            s_loss = s_loss.float().mean().type_as(s_loss)
             if args.fp16:
-                optimizer.backward(loss)
+                t_optimizer.backward(t_loss)
+                s_optimizer.backward(s_loss)
             else:
-                loss.backward()
-            train_loss += loss.float().item()
+                t_loss.backward()
+                s_loss.backward()
+            t_train_loss += t_loss.float().item()
+            s_train_loss += s_loss.float().item()
 
+            # else:
+            #     t_loss = t_loss.float().mean().type_as(t_loss)
+            #     if args.fp16:
+            #         t_optimizer.backward(t_loss)
+            #     else:
+            #         t_loss.backward()
+            #     t_train_loss += t_loss.float().item()
+        
+        # if args.alpha > 0:
         if args.fp16:
-            optimizer.clip_master_grads(args.clip)
+            t_optimizer.clip_master_grads(args.clip)
+            s_optimizer.clip_master_grads(args.clip)
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+            torch.nn.utils.clip_grad_norm_(t_model.parameters(), args.clip)
+            torch.nn.utils.clip_grad_norm_(s_model.parameters(), args.clip)
 
-        optimizer.step()
+        t_optimizer.step()
+        s_optimizer.step()
         if args.sample_softmax > 0:
-            optimizer_sparse.step()
+            t_optimizer_sparse.step()
+            s_optimizer_sparse.step()
+
+        # else:
+        #     if args.fp16:
+        #         t_optimizer.clip_master_grads(args.clip)
+        #     else:
+        #         torch.nn.utils.clip_grad_norm_(t_model.parameters(), args.clip)
+
+        #     t_optimizer.step()
+        #     if args.sample_softmax > 0:
+        #         t_optimizer_sparse.step()
+        
+        for _ in range(args.student_ratio):
+            data, target, seq_len = train_iter.get_batch(current_index)
+            current_index=(seq_len+current_index) % (train_iter.data.size(0) - 1)
+            t_model.zero_grad()
+            s_model.zero_grad()
+            if args.batch_chunk > 1:
+                data_chunks = torch.chunk(data, args.batch_chunk, 1)
+                target_chunks = torch.chunk(target, args.batch_chunk, 1)
+                for i in range(args.batch_chunk):
+                    data_i = data_chunks[i].contiguous()
+                    target_i = target_chunks[i].contiguous()
+                    
+                    t_ret, t_logit = t_para_model(data_i, target_i, *t_mems[i])
+                    t_loss, t_mems[i] = t_ret[0], t_ret[1:]
+                    s_ret, s_logit = s_para_model(data_i, target_i, *s_mems[i])
+                    s_loss, s_mems[i] = s_ret[0], s_ret[1:]
+
+                    s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
+
+                    s_loss = s_loss.float().mean().type_as(s_loss) / args.batch_chunk
+                    if args.fp16:
+                        s_optimizer.backward(s_loss)
+                    else:
+                        s_loss.backward()
+            else:
+                t_ret, t_logit = t_para_model(data, target, *t_mems)
+                t_loss, t_mems = t_ret[0], t_ret[1:]
+                s_ret, s_logit = s_para_model(data, target, *s_mems)
+                s_loss, s_mems = s_ret[0], s_ret[1:]
+
+                s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
+                s_loss = s_loss.float().mean().type_as(s_loss)
+                if args.fp16:
+                    s_optimizer.backward(s_loss)
+                else:
+                    s_loss.backward()
+            if args.fp16:
+                s_optimizer.clip_master_grads(args.clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(s_model.parameters(), args.clip)
+            s_optimizer.step()
+            if args.sample_softmax > 0:
+                s_optimizer_sparse.step()
 
         # step-wise learning rate annealing
         train_step += 1
@@ -471,59 +679,74 @@ def train():
             # linear warmup stage
             if train_step < args.warmup_step:
                 curr_lr = args.lr * train_step / args.warmup_step
-                optimizer.param_groups[0]['lr'] = curr_lr
+                t_optimizer.param_groups[0]['lr'] = curr_lr
+                s_optimizer.param_groups[0]['lr'] = curr_lr
                 if args.sample_softmax > 0:
-                    optimizer_sparse.param_groups[0]['lr'] = curr_lr * 2
+                    t_optimizer_sparse.param_groups[0]['lr'] = curr_lr * 2
+                    s_optimizer_sparse.param_groups[0]['lr'] = curr_lr * 2
             else:
                 if args.scheduler == 'cosine':
-                    scheduler.step(train_step)
+                    t_scheduler.step(train_step)
+                    s_scheduler.step(train_step)
                     if args.sample_softmax > 0:
-                        scheduler_sparse.step(train_step)
+                        t_scheduler_sparse.step(train_step)
+                        s_scheduler_sparse.step(train_step)
         elif args.scheduler == 'inv_sqrt':
-            scheduler.step(train_step)
+            t_scheduler.step(train_step)
+            s_scheduler.step(train_step)
 
         if train_step % args.log_interval == 0:
-            cur_loss = train_loss / args.log_interval
+            t_cur_loss = t_train_loss / args.log_interval
+            s_cur_loss = s_train_loss / args.log_interval
             elapsed = time.time() - log_start_time
             log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
-                      '| ms/batch {:5.2f} | loss {:5.2f}'.format(
-                epoch, train_step, batch+1, optimizer.param_groups[0]['lr'],
-                elapsed * 1000 / args.log_interval, cur_loss)
+                      '| ms/batch {:5.2f} | teacher_loss {:5.2f} | student_loss {:5.2f}'.format(
+                epoch, train_step, batch+1, t_optimizer.param_groups[0]['lr'],
+                elapsed * 1000 / args.log_interval, t_cur_loss, s_cur_loss)
             if args.dataset in ['enwik8', 'text8']:
-                log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
+                log_str += ' | teacher bpc {:9.5f} | student bpc {:9.5f}'.format(t_cur_loss / math.log(2), s_cur_loss / math.log(2))
             else:
-                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
+                log_str += ' | teacher ppl {:9.3f} | student ppl {:9.5f}'.format(math.exp(t_cur_loss), math.exp(s_cur_loss))
             logging(log_str)
-            train_loss = 0
+            wandb.log({'lr': t_optimizer.param_groups[0]['lr'], 'teacher_train_loss': t_cur_loss, 'student_train_loss': s_cur_loss}, step=train_step)
+            t_train_loss = 0
+            s_train_loss = 0
             log_start_time = time.time()
 
         if train_step % args.eval_interval == 0:
-            val_loss = evaluate(va_iter)
+            t_val_loss, s_val_loss = evaluate(va_iter)
             logging('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
-                      '| valid loss {:5.2f}'.format(
+                      '| teacher valid loss {:5.2f} | student valid loss {:5.2f}'.format(
                 train_step // args.eval_interval, train_step,
-                (time.time() - eval_start_time), val_loss)
+                (time.time() - eval_start_time), t_val_loss, s_val_loss)
             if args.dataset in ['enwik8', 'text8']:
-                log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
+                log_str += ' | teacher bpc {:9.5f} | student bpc {:9.5f}'.format(t_val_loss / math.log(2), s_val_loss / math.log(2))
             else:
-                log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
+                log_str += ' | teacher valid ppl {:9.3f} | student valid ppl {:9.3f}'.format(math.exp(t_val_loss), math.exp(s_val_loss))
             logging(log_str)
             logging('-' * 100)
+            wandb.log({'teacher_valid_ppl': math.exp(t_val_loss), 'student_valid_ppl': math.exp(s_val_loss)}, step=train_step)
             # Save the model if the validation loss is the best we've seen so far.
-            if not best_val_loss or val_loss < best_val_loss:
+            if not t_best_val_loss or t_val_loss < t_best_val_loss:
                 if not args.debug:
-                    with open(os.path.join(args.work_dir, 'model.pt'), 'wb') as f:
-                        torch.save(model, f)
-                    with open(os.path.join(args.work_dir, 'optimizer.pt'), 'wb') as f:
-                        torch.save(optimizer.state_dict(), f)
-                best_val_loss = val_loss
+                    with open(os.path.join(args.work_dir, 't_model.pt'), 'wb') as f:
+                        torch.save(t_model, f)
+                    with open(os.path.join(args.work_dir, 't_optimizer.pt'), 'wb') as f:
+                        torch.save(t_optimizer.state_dict(), f)
+                    with open(os.path.join(args.work_dir, 's_model.pt'), 'wb') as f:
+                        torch.save(s_model, f)
+                    with open(os.path.join(args.work_dir, 's_optimizer.pt'), 'wb') as f:
+                        torch.save(s_optimizer.state_dict(), f)
+                t_best_val_loss = t_val_loss
 
             # dev-performance based learning rate annealing
             if args.scheduler == 'dev_perf':
-                scheduler.step(val_loss)
+                t_scheduler.step(t_val_loss)
+                s_scheduler.step(s_val_loss)
                 if args.sample_softmax > 0:
-                    scheduler_sparse.step(val_loss)
+                    t_scheduler_sparse.step(t_val_loss)
+                    s_scheduler_sparse.step(s_val_loss)
 
             eval_start_time = time.time()
 
@@ -532,8 +755,9 @@ def train():
 
 # Loop over epochs.
 train_step = 0
-train_loss = 0
-best_val_loss = None
+t_train_loss = 0
+t_best_val_loss = None
+s_train_loss = 0
 
 log_start_time = time.time()
 eval_start_time = time.time()
@@ -542,7 +766,7 @@ eval_start_time = time.time()
 try:
     for epoch in itertools.count(start=1):
         train()
-        if train_step == args.max_step:
+        if train_step == args.max_step or epoch > args.max_epoch:
             logging('-' * 100)
             logging('End of training')
             break
@@ -551,17 +775,20 @@ except KeyboardInterrupt:
     logging('Exiting from training early')
 
 # Load the best saved model.
-with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
-    model = torch.load(f)
-para_model = model.to(device)
-
+with open(os.path.join(args.work_dir, 't_model.pt'), 'rb') as f:
+    t_model = torch.load(f)
+t_para_model = t_model.to(device)
+with open(os.path.join(args.work_dir, 's_model.pt'), 'rb') as f:
+    s_model = torch.load(f)
+s_para_model = s_model.to(device)
 # Run on test data.
-test_loss = evaluate(te_iter)
+t_test_loss, s_test_loss = evaluate(te_iter)
 logging('=' * 100)
 if args.dataset in ['enwik8', 'text8']:
-    logging('| End of training | test loss {:5.2f} | test bpc {:9.5f}'.format(
-        test_loss, test_loss / math.log(2)))
+    logging('| End of training | teacher test loss {:5.2f} | teacher test bpc {:9.5f} | student test loss {:5.2f} | student test bpc {:9.5f}'.format(
+        t_test_loss, t_test_loss / math.log(2), s_test_loss, s_test_loss / math.log(2)))
 else:
-    logging('| End of training | test loss {:5.2f} | test ppl {:9.3f}'.format(
-        test_loss, math.exp(test_loss)))
+    logging('| End of training | teacher test loss {:5.2f} | teacher test ppl {:9.3f} | student test loss {:5.2f} | student test ppl {:9.3f}'.format(
+        t_test_loss, math.exp(t_test_loss), s_test_loss, math.exp(s_test_loss)))
 logging('=' * 100)
+wandb.log({'teacher_test_ppl': math.exp(t_test_loss), 'student_test_ppl': math.exp(s_test_loss)}, step=train_step)

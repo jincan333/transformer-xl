@@ -1,12 +1,15 @@
 #!/bin/bash
 max_step=200000
-experiment_name=transfomer_ptb_baseline_${max_step}
+lr=0.00025
+gpu=3
+mem_len=0
+experiment_name=transfomer_ptb_baseline_${max_step}_${lr}_${gpu}_${mem_len}
 if [[ $1 == 'train' ]]; then
     echo 'Run training...'
     log_filename=logs/train_${experiment_name}.log
     nohup python -u pytorch/train.py \
         --cuda \
-        --gpu 2 \
+        --gpu ${gpu} \
         --data data/ptb/ \
         --dataset ptb \
         --adaptive \
@@ -18,13 +21,14 @@ if [[ $1 == 'train' ]]; then
         --dropout 0.1 \
         --dropatt 0.0 \
         --optim adam \
-        --lr 0.00025 \
+        --lr ${lr} \
         --warmup_step 0 \
-        --max_step 200000 \
+        --max_step 10000 \
         --tgt_len 150 \
-        --mem_len 150 \
+        --mem_len ${mem_len} \
         --eval_tgt_len 150 \
         --batch_size 60 \
+        --eval-interval 200 \
         ${@:2} \
         > ${log_filename} 2>&1 &
         # --multi_gpu \
