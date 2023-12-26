@@ -4,4 +4,5 @@ LM-TFM-ptb/
 pytorch/__pycache__/
 pytorch/utils/__pycache__/
 logs/
+ptb_logs/
 wandb/

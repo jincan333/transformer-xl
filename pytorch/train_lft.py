@@ -147,7 +147,8 @@ parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.  If supplied, this argument'
                     ' supersedes --static-loss-scale.')
 parser.add_argument('--alpha', type=float, default= 0)
-parser.add_argument('--student_ratio', type=int, default= 0)
+parser.add_argument('--student_alpha', type=float, default= 0)
+parser.add_argument('--student_ratio', type=int, default= 5)
 parser.add_argument('--models_num', type=int, default= 2)
 parser.add_argument('--T', type=float, default=1.5)
 parser.add_argument('--exp_name', type=str, default='test')
@@ -530,9 +531,13 @@ def train():
     if args.batch_chunk > 1:
         t_mems = [tuple() for _ in range(args.batch_chunk)]
         s_mems = [tuple() for _ in range(args.batch_chunk)]
+        s_t_mems = [tuple() for _ in range(args.batch_chunk)]
+        s_s_mems = [tuple() for _ in range(args.batch_chunk)]
     else:
         t_mems = tuple()
         s_mems = tuple()
+        s_t_mems = tuple()
+        s_s_mems = tuple()
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
     for batch, (data, target, seq_len) in enumerate(train_iter):
         t_model.zero_grad()
@@ -550,13 +555,11 @@ def train():
                 # if args.alpha > 0:
                 s_ret, s_logit = s_para_model(data_i, target_i, *s_mems[i])
                 s_loss, s_mems[i] = s_ret[0], s_ret[1:]
-                
-                if epoch > args.start_epoch:
-                    t_loss += args.alpha * kl_div_logits(t_logit, s_logit.detach(), args.T)
-                    s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
-
                 t_loss = t_loss.float().mean().type_as(t_loss) / args.batch_chunk
                 s_loss = s_loss.float().mean().type_as(s_loss) / args.batch_chunk
+                if epoch > args.start_epoch:
+                    t_loss += args.alpha * kl_div_logits(t_logit, s_logit.detach(), args.T)
+                    s_loss += args.alpha * kl_div_logits(s_logit, t_logit.detach(), args.T)
                 if args.fp16:
                     t_optimizer.backward(t_loss)
                     s_optimizer.backward(s_loss)
@@ -577,17 +580,14 @@ def train():
         else:
             t_ret, t_logit = t_para_model(data, target, *t_mems)
             t_loss, t_mems = t_ret[0], t_ret[1:]
-
             # if args.alpha > 0:
             s_ret, s_logit = s_para_model(data, target, *s_mems)
             s_loss, s_mems = s_ret[0], s_ret[1:]
-
-            if epoch > args.start_epoch:
-                t_loss += args.alpha * kl_div_logits(t_logit, s_logit.detach(), args.T)
-                s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
-
             t_loss = t_loss.float().mean().type_as(t_loss)
             s_loss = s_loss.float().mean().type_as(s_loss)
+            if epoch > args.start_epoch:
+                t_loss += args.alpha * kl_div_logits(t_logit, s_logit.detach(), args.T)
+                s_loss += args.alpha * kl_div_logits(s_logit, t_logit.detach(), args.T)
             if args.fp16:
                 t_optimizer.backward(t_loss)
                 s_optimizer.backward(s_loss)
@@ -630,37 +630,36 @@ def train():
         #         t_optimizer_sparse.step()
         
         for _ in range(args.student_ratio):
-            data, target, seq_len = train_iter.get_batch(current_index)
-            current_index=(seq_len+current_index) % (train_iter.data.size(0) - 1)
+            s_data, s_target, s_seq_len = train_iter.get_batch(current_index)
+            current_index=(s_seq_len+current_index) % (train_iter.data.size(0) - 1)
             t_model.zero_grad()
             s_model.zero_grad()
             if args.batch_chunk > 1:
-                data_chunks = torch.chunk(data, args.batch_chunk, 1)
-                target_chunks = torch.chunk(target, args.batch_chunk, 1)
+                data_chunks = torch.chunk(s_data, args.batch_chunk, 1)
+                target_chunks = torch.chunk(s_target, args.batch_chunk, 1)
                 for i in range(args.batch_chunk):
                     data_i = data_chunks[i].contiguous()
                     target_i = target_chunks[i].contiguous()
                     
-                    t_ret, t_logit = t_para_model(data_i, target_i, *t_mems[i])
-                    t_loss, t_mems[i] = t_ret[0], t_ret[1:]
-                    s_ret, s_logit = s_para_model(data_i, target_i, *s_mems[i])
-                    s_loss, s_mems[i] = s_ret[0], s_ret[1:]
-
-                    s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
-
+                    t_ret, t_logit = t_para_model(data_i, target_i, *s_t_mems[i])
+                    t_loss, s_t_mems[i] = t_ret[0], t_ret[1:]
+                    s_ret, s_logit = s_para_model(data_i, target_i, *s_s_mems[i])
+                    s_loss, s_s_mems[i] = s_ret[0], s_ret[1:]
                     s_loss = s_loss.float().mean().type_as(s_loss) / args.batch_chunk
+                    s_loss += args.alpha * kl_div_logits(s_logit, t_logit.detach(), args.T)
+
                     if args.fp16:
                         s_optimizer.backward(s_loss)
                     else:
                         s_loss.backward()
             else:
-                t_ret, t_logit = t_para_model(data, target, *t_mems)
-                t_loss, t_mems = t_ret[0], t_ret[1:]
-                s_ret, s_logit = s_para_model(data, target, *s_mems)
-                s_loss, s_mems = s_ret[0], s_ret[1:]
-
-                s_loss += args.alpha * kl_div_logits(t_logit.detach(), s_logit, args.T)
+                t_ret, t_logit = t_para_model(s_data, s_target, *s_t_mems)
+                t_loss, s_t_mems = t_ret[0], t_ret[1:]
+                s_ret, s_logit = s_para_model(s_data, s_target, *s_s_mems)
+                s_loss, s_s_mems = s_ret[0], s_ret[1:]
                 s_loss = s_loss.float().mean().type_as(s_loss)
+                s_loss += args.alpha * kl_div_logits(s_logit, t_logit.detach(), args.T)
+                
                 if args.fp16:
                     s_optimizer.backward(s_loss)
                 else:
@@ -750,7 +749,7 @@ def train():
 
             eval_start_time = time.time()
 
-        if train_step == args.max_step:
+        if train_step == args.max_step or epoch > args.max_epoch:
             break
 
 # Loop over epochs.
