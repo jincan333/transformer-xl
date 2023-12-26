@@ -2,12 +2,12 @@
 max_step=300000
 max_epoch=4
 len=100
-batch_size=15
-alpha=0.01
+batch_size=20
+alpha=0.1
 student_ratio=4
 start_epoch=-1
 T=1.5
-gpu=4
+gpu=0
 prefix='4.debug'
 experiment_name=${prefix}_transfomer_wt103_lft_${max_step}_${max_epoch}_${len}_${batch_size}_${alpha}_${student_ratio}_${start_epoch}_${T}_${gpu}
 echo 'Run training...'

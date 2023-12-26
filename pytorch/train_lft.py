@@ -194,7 +194,7 @@ if args.fp16:
 device = torch.device(f'cuda:{args.gpu}' if args.cuda else 'cpu')
 
 current_file_dir = os.path.dirname(os.path.abspath(__file__))
-config_file_path = os.path.join(current_file_dir, '../../.config')
+config_file_path = os.path.abspath(os.path.join(current_file_dir, '../../.config'))
 config=configparser.ConfigParser()
 config.read(config_file_path)
 wandb_username=config.get('WANDB', 'USER_NAME')
