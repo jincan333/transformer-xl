@@ -1,17 +1,17 @@
 #!/bin/bash
-max_step=10000
+max_step=12000
 max_epoch=60
 len=70
 batch_size=60
-alpha=0
-student_ratio=0
+alpha=0.5
+student_ratio=3
 start_epoch=-1
 T=1.5
 lr=0.001
-clip=0.25
+clip=0.35
 dropout=0.25
-gpu=6
-prefix='1.baseline_clip'
+gpu=0
+prefix='4.student_ratio'
 experiment_name=${prefix}_transfomer_ptb_lft_${max_step}_${max_epoch}_${len}_${batch_size}_${alpha}_${student_ratio}_${start_epoch}_${T}_${lr}_${clip}_${dropout}_${gpu}
 echo 'Run training...'
 log_filename=ptb_logs/${experiment_name}.log
@@ -36,7 +36,7 @@ nohup python -u pytorch/train_lft.py \
     --mem_len ${len} \
     --eval_tgt_len ${len} \
     --batch_size ${batch_size} \
-    --eval-interval 200 \
+    --eval-interval 1000 \
     --alpha ${alpha} \
     --student_ratio ${student_ratio} \
     --T ${T} \
