@@ -1,6 +1,6 @@
 #!/bin/bash
 max_step=400000
-max_epoch=4
+max_epoch=3
 len=100
 batch_size=10
 # alpha_list=(0.01 0.001)
@@ -10,7 +10,7 @@ student_ratio=4
 start_epoch=-1
 # T_list=(1 2 3 4)
 T=1.5
-gpu=0
+gpu=2
 prefix='4.alpha'
 experiment_name=${prefix}_transfomer_wt103_lft_${max_step}_${max_epoch}_${len}_${batch_size}_${alpha}_${student_ratio}_${start_epoch}_${T}_${gpu}
 echo 'Run training...'
