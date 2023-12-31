@@ -154,6 +154,8 @@ parser.add_argument('--T', type=float, default=1.5)
 parser.add_argument('--exp_name', type=str, default='test')
 parser.add_argument('--max_epoch', type=int, default=4)
 parser.add_argument('--start_epoch', type=int, default=-1)
+parser.add_argument('--auto_step', type=int, default=0)
+
 
 
 args = parser.parse_args()
@@ -216,6 +218,10 @@ va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
     device=device, ext_len=args.ext_len)
 te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
     device=device, ext_len=args.ext_len)
+if args.auto_step:
+    args.eval_interval = math.ceil(tr_iter.data.size(0) / args.tgt_len)
+    args.max_step = args.max_epoch * args.eval_interval
+
 
 # adaptive softmax / embedding
 cutoffs, tie_projs = [], [False]
@@ -751,6 +757,7 @@ def train():
 
         if train_step == args.max_step or epoch > args.max_epoch:
             break
+    
 
 # Loop over epochs.
 train_step = 0
