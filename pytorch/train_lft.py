@@ -196,7 +196,7 @@ if args.fp16:
 device = torch.device(f'cuda:{args.gpu}' if args.cuda else 'cpu')
 
 current_file_dir = os.path.dirname(os.path.abspath(__file__))
-config_file_path = os.path.abspath(os.path.join(current_file_dir, '../../.config'))
+config_file_path = os.path.abspath(os.path.join(current_file_dir, '../../key.config'))
 config=configparser.ConfigParser()
 config.read(config_file_path)
 wandb_username=config.get('WANDB', 'USER_NAME')
@@ -221,6 +221,8 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 if args.auto_step:
     args.eval_interval = math.ceil(tr_iter.data.size(0) / args.tgt_len)
     args.max_step = args.max_epoch * args.eval_interval
+    if args.dataset=='wt103':
+        args.eval_interval = 1000
 
 
 # adaptive softmax / embedding
